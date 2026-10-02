@@ -1,0 +1,120 @@
+name: Build indexer image (amd64)
+
+# Builds the Blockscout backend (indexer + API) image for linux/amd64 on a native
+# amd64 runner and publishes it as a downloadable .tar.gz artifact.
+#
+# On workflow_dispatch it also pushes to docker.io/proviroll/blockscout, so the image
+# can be pulled through an Artifactory Docker Hub remote.
+#
+# Rationale: the target environment is a bank VM with no direct egress to ghcr.io or
+# registry-1.docker.io; it reaches Docker Hub only through an Artifactory proxy. The
+# tarball covers the case where that proxy does not allow the proviroll namespace.
+#
+# Building on a native amd64 runner is required: cross-building this image from an
+# arm64 host (Apple Silicon) fails non-deterministically because the Erlang JIT is
+# not reliably emulated under either QEMU or Rosetta.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag or SHA)"
+        required: false
+        default: master
+      push_dockerhub:
+        description: "Push the image to docker.io/proviroll/blockscout"
+        required: false
+        type: boolean
+        default: true
+  pull_request:
+    paths:
+      - ".github/workflows/build-indexer-image.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build linux/amd64
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref || github.ref }}
+
+      - name: Resolve version
+        id: version
+        run: |
+          set -euo pipefail
+          # RELEASE_VERSION must match mix.exs: the Dockerfile copies config_helper.exs
+          # into /app/releases/${RELEASE_VERSION}/ and a mismatch breaks the image.
+          VERSION=$(grep -oE 'version: "[0-9]+\.[0-9]+\.[0-9]+"' mix.exs | head -1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
+          if [ -z "$VERSION" ]; then echo "could not parse version from mix.exs" >&2; exit 1; fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Building Blockscout $VERSION"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Never push from a pull_request event: PR builds stay artifact-only.
+      - name: Log in to Docker Hub
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.push_dockerhub }}
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: blockscout/blockscout:${{ steps.version.outputs.version }}
+          build-args: |
+            RELEASE_VERSION=${{ steps.version.outputs.version }}
+            BLOCKSCOUT_VERSION=v${{ steps.version.outputs.version }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Inspect image
+        run: |
+          set -euo pipefail
+          IMAGE=blockscout/blockscout:${{ steps.version.outputs.version }}
+          docker image inspect "$IMAGE" \
+            --format 'arch={{.Architecture}}/{{.Os}} size={{.Size}}'
+          # Fail loudly rather than shipping an unusable artifact.
+          ARCH=$(docker image inspect "$IMAGE" --format '{{.Architecture}}')
+          [ "$ARCH" = "amd64" ] || { echo "expected amd64, got $ARCH" >&2; exit 1; }
+
+      - name: Save image to tarball
+        run: |
+          set -euo pipefail
+          IMAGE=blockscout/blockscout:${{ steps.version.outputs.version }}
+          docker save "$IMAGE" | gzip -9 > blockscout-indexer-${{ steps.version.outputs.version }}-amd64.tar.gz
+          ls -lh blockscout-indexer-*.tar.gz
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: blockscout-indexer-${{ steps.version.outputs.version }}-amd64
+          path: blockscout-indexer-${{ steps.version.outputs.version }}-amd64.tar.gz
+          retention-days: 30
+          compression-level: 0
+
+      - name: Push to Docker Hub
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.push_dockerhub }}
+        run: |
+          set -euo pipefail
+          VERSION=${{ steps.version.outputs.version }}
+          SRC=blockscout/blockscout:$VERSION
+          for TAG in "$VERSION" latest; do
+            docker tag "$SRC" "docker.io/proviroll/blockscout:$TAG"
+            docker push "docker.io/proviroll/blockscout:$TAG"
+          done
+          echo "Pushed docker.io/proviroll/blockscout:$VERSION and :latest"
